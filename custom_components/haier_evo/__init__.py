@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from requests.exceptions import RequestException
 from tenacity import RetryError
 
+from homeassistant.components.frontend import add_extra_js_url
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.core import HomeAssistant
@@ -11,6 +15,7 @@ from homeassistant.loader import async_get_integration
 from .logger import _LOGGER
 from .const import DOMAIN
 from . import api
+from .machine import async_setup_machines
 
 
 PLATFORMS: list[str] = [
@@ -20,6 +25,14 @@ PLATFORMS: list[str] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,
 ]
+
+
+async def async_setup(hass: HomeAssistant, config: dict) -> bool:
+    card_path = Path(__file__).parent / "haier-laundry-card.js"
+    url = "/haier_evo_frontend/haier-laundry-card.js"
+    await hass.http.async_register_static_paths([StaticPathConfig(url, str(card_path), False)])
+    add_extra_js_url(hass, url)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -37,7 +50,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         haier_object.stop()
         hass.data[DOMAIN].pop(entry.entry_id, None)
         raise ConfigEntryNotReady("Haier device discovery is temporarily unavailable") from err
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        haier_object.laundry_platform = await async_setup_machines(hass, entry)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        if platform := getattr(haier_object, "laundry_platform", None):
+            await platform.async_destroy()
+        haier_object.stop()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
     return True
 
 
@@ -47,4 +68,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         haier_object = hass.data[DOMAIN].pop(entry.entry_id)
         _LOGGER.debug(f'Integration {haier_object} unload...')
         haier_object.stop()
+        await haier_object.laundry_platform.async_destroy()
     return unload_ok

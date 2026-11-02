@@ -142,6 +142,7 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
         self.api = SimpleNamespace(Haier=Mock(return_value=self.client),
                                    InvalidDevicesList=InvalidDevicesList)
         namespace = {"DOMAIN": "haier_evo", "api": self.api,
+                     "async_setup_machines": AsyncMock(),
                      "PLATFORMS": ["climate", "switch"],
                      "ConfigEntryNotReady": ConfigEntryNotReady,
                      "RequestException": TimeoutError, "RetryError": RetryError,
