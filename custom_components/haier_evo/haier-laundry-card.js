@@ -55,7 +55,7 @@ class HaierLaundryCard extends HTMLElement {
     const ids = ['machine', 'program', 'remote', 'status', 'phase', 'current_program', 'duration'];
     const signature = JSON.stringify(ids.map(key => {
       const state = hass.states[this.entities[key]];
-      return [state?.state, state?.attributes?.options, state?.attributes?.available_actions, state?.attributes?.program_catalog, state?.attributes?.program_settings, state?.attributes?.active_program_details];
+      return [state?.state, state?.attributes?.options, state?.attributes?.available_actions, state?.attributes?.program_catalog, state?.attributes?.program_settings, state?.attributes?.active_program_details, state?.attributes?.laundry_ready, state?.attributes?.care_name, state?.attributes?.machine_kind];
     }));
     if (signature !== this.signature) {
       this.signature = signature;
@@ -117,7 +117,12 @@ class HaierLaundryCard extends HTMLElement {
     const c = { ...this.entities, ...this.config };
     const reportedStatus = this.value('status');
     const status = reportedStatus === 'not_reported' ? null : reportedStatus;
-    const statuses = { idle: 'Ожидание', running: 'Выполняется', paused: 'Пауза', finished: 'Программа завершена', cancelled: 'Программа отменена' };
+    const isDryer = (this.state('machine')?.attributes?.machine_kind ?? c.kind) === 'dryer';
+    const rawCareName = this.state('machine')?.attributes?.care_name;
+    const careName = typeof rawCareName === 'string' && rawCareName.trim() ? rawCareName.trim() : 'Уход после программы';
+    const care = status === 'care';
+    const laundryReady = this.state('machine')?.attributes?.laundry_ready === true;
+    const statuses = { care: isDryer ? 'Основная сушка завершена' : 'Основная стирка завершена', idle: 'Ожидание', running: 'Выполняется', paused: 'Пауза', finished: 'Программа завершена', cancelled: 'Программа отменена' };
     const phaseValue = this.value('phase');
     const statusText = statuses[status] || (phaseValue && !/^(Код|Code)\s/.test(phaseValue) ? phaseValue : 'Нет данных о цикле');
     const options = this.state('program')?.attributes?.options || [];
@@ -126,7 +131,7 @@ class HaierLaundryCard extends HTMLElement {
     const selectedProgram = selected && selected !== unselected && options.includes(selected);
     const remote = this.value('remote');
     const connected = remote === 'on';
-    const active = status === 'running' || status === 'paused';
+    const active = status === 'running' || status === 'paused' || care;
     if (!active) this.detailsOpen = false;
     if (status === 'running') this.motionSince ??= Date.now();
     else this.motionSince = null;
@@ -136,16 +141,16 @@ class HaierLaundryCard extends HTMLElement {
     const numeric = value => typeof value === 'number' || (typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value.trim())) ? Number(value) : NaN;
     const remainingMinutes = numeric(rawRemaining);
     const totalMinutes = numeric(actualDetails?.total_minutes);
-    const progress = active && Number.isFinite(remainingMinutes) && remainingMinutes >= 0 && Number.isFinite(totalMinutes) && totalMinutes > remainingMinutes ? (totalMinutes - remainingMinutes) / totalMinutes * 100 : null;
+    const progress = active && !care && Number.isFinite(remainingMinutes) && remainingMinutes >= 0 && Number.isFinite(totalMinutes) && totalMinutes > remainingMinutes ? (totalMinutes - remainingMinutes) / totalMinutes * 100 : null;
     const uncertain = !status;
     const canStart = connected && selectedProgram && this.usable('start') && (status === 'idle' || uncertain) && !this.pending;
-    const action = status === 'running' ? 'pause' : status === 'paused' ? 'resume' : null;
+    const action = status === 'running' ? 'pause' : status === 'paused' ? 'resume' : care ? (this.usable('pause') ? 'pause' : this.usable('resume') ? 'resume' : null) : null;
     const canToggle = connected && action && this.usable(action) && !this.pending;
     const canCancel = connected && (active || uncertain) && this.usable('cancel') && !this.pending;
     const canChooseToggle = connected && uncertain && !this.pending && (this.usable('pause') || this.usable('resume'));
-    const isDryer = c.kind === 'dryer';
     const device = this._hass.devices?.[c.device];
     if (!connected || active || this.pending) this.programMenuOpen = false;
+    const subview = !!(this.detailsOpen || this.programMenuOpen);
     const startButton = `<button class="${active ? 'destructive' : 'primary'}" id="start" aria-controls="start-choices" aria-expanded="false"><ha-icon id="start-icon"></ha-icon><span id="start-label"></span></button>`;
     const toggleButton = `<button class="${active ? 'primary' : ''}" id="toggle" aria-controls="toggle-choices" aria-expanded="false"><ha-icon id="toggle-icon"></ha-icon><span id="toggle-label"></span></button>`;
     this.shadowRoot.innerHTML = `
@@ -153,14 +158,14 @@ class HaierLaundryCard extends HTMLElement {
         :host { display: block; color: var(--primary-text-color); font-family: var(--paper-font-body1_-_font-family, inherit); }
         ha-card { padding: 22px; overflow: hidden; }
         h2, p { margin: 0; }
-        .heading { position: relative; display: flex; gap: 12px; align-items: center; padding-left: 44px; }
-        .heading .back { position: absolute; left: 0; top: 0; width: 40px; min-height: 40px; padding: 0; background: transparent; }
+        .heading { display: grid; grid-template-columns: 40px minmax(0, 1fr) 44px; gap: 8px; align-items: center; }
+        .heading .back { width: 40px; min-height: 40px; padding: 0; background: transparent; }
         .heading > div { min-width: 0; }
         .heading ha-icon { color: var(--primary-color); --mdc-icon-size: 25px; }
-        .heading .remote-button { margin-left: auto; flex-shrink: 0; padding: 0; width: 44px; }
+        .heading .remote-button { padding: 0; width: 44px; }
         .remote-info { margin-top: 10px; padding: 12px; border-radius: 9px; background: var(--secondary-background-color); font-size: 13px; line-height: 1.45; }
         [hidden] { display: none !important; }
-        h2 { font-size: 19px; font-weight: 600; line-height: 1.3; overflow-wrap: anywhere; }
+        h2 { font-size: 19px; font-weight: 600; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .connection { margin-top: 3px; color: var(--secondary-text-color); font-size: 13px; }
         .visual { display: flex; min-height: 112px; align-items: center; justify-content: center; gap: 24px; margin: 16px 0; }
         .drum { position: relative; width: 112px; height: 112px; border-radius: 50%; background: var(--secondary-background-color); display: grid; place-items: center; flex-shrink: 0; }
@@ -234,7 +239,7 @@ class HaierLaundryCard extends HTMLElement {
         @media (max-width: 380px) { ha-card { padding: 17px; } .visual { gap: 16px; } .drum { width: 88px; height: 88px; } .settings-grid:not(#active-fields) { grid-template-columns: 1fr; } }
       </style>
       <ha-card>
-        <div class="heading"><button type="button" class="back" id="details-back" aria-label="Назад" hidden><ha-icon icon="mdi:arrow-left"></ha-icon></button><div><h2 id="name"></h2><p class="connection" id="connection"></p></div><button type="button" class="remote-button" id="remote-info-button" aria-controls="remote-info" aria-expanded="false"><ha-icon icon="mdi:access-point"></ha-icon></button></div>
+        <div class="heading"><button type="button" class="back" id="details-back" aria-label="${subview ? 'Назад' : 'Закрыть'}"><ha-icon icon="${subview ? 'mdi:arrow-left' : 'mdi:close'}"></ha-icon></button><div><h2 id="name"></h2><p class="connection" id="connection"></p></div><button type="button" class="remote-button" id="remote-info-button" aria-controls="remote-info" aria-expanded="false"><ha-icon icon="mdi:access-point"></ha-icon></button></div>
         <p class="remote-info" id="remote-info" hidden>Включение и выключение дистанционного управления выполняется на панели машины.</p>
         <div id="main-view"><div class="visual"><div class="drum" id="drum" aria-hidden="true" style="--motion-delay:-${motionOffset}s"><svg viewBox="0 0 112 112"><circle class="meter-track" cx="56" cy="56" r="53"/><circle class="meter-value" id="meter" cx="56" cy="56" r="53" pathLength="100" transform="rotate(-90 56 56)" hidden/><rect class="machine-body" x="29" y="17" width="54" height="78" rx="7"/><path class="machine-body" d="M29 32h54"/><circle class="machine-marks" cx="36" cy="24.5" r="1.7"/><circle class="machine-marks" cx="42" cy="24.5" r="1.7"/><circle class="machine-glass" cx="56" cy="59" r="21"/><clipPath id="drum-clip"><circle cx="56" cy="59" r="18"/></clipPath><g clip-path="url(#drum-clip)"><g class="laundry"><path d="M43 49q8-5 14 1t-1 13q-7 5-14-1t1-13Z"/><path d="M60 58q8-4 10 4t-5 9q-7-1-5-13Z"/></g><path class="water" id="water" d="M34 65q6-3 12 0t12 0t12 0t12 0v18H34Z"/><g class="bubbles" id="bubbles"><circle cx="47" cy="53" r="1.4"/><circle cx="65" cy="48" r="1.2"/><circle cx="70" cy="58" r="1.5"/></g></g><g class="heat" id="heat"><path d="M47 87q-3-3 0-6t0-6"/><path d="M56 87q-3-3 0-6t0-6"/><path d="M65 87q-3-3 0-6t0-6"/></g></svg></div><div class="summary"><p class="status" id="status"></p><p class="phase" id="phase"></p><p class="current" id="current"></p><p class="current" id="remaining"></p><p class="current" id="completion"></p></div></div>
         <div class="fields" id="program-fields"><label>Выбранная программа</label><p class="current" id="selected-name"></p><button type="button" class="program-trigger" id="program" aria-controls="program-options" aria-expanded="false"><ha-icon id="selected-icon"></ha-icon><span>Все программы</span></button><div class="program-options" id="program-options" hidden><div class="search-row"><input id="program-search" type="search" aria-label="Поиск программы" placeholder="Найти программу" autocomplete="off"><button type="button" id="clear-search" aria-label="Очистить поиск">Очистить</button></div><div class="program-list" id="program-list"></div><p class="program-empty" id="program-empty" role="status" aria-live="polite" hidden></p></div></div>
@@ -249,9 +254,10 @@ class HaierLaundryCard extends HTMLElement {
       </ha-card>`;
     const $ = id => this.shadowRoot.getElementById(id);
     $('name').textContent = c.name || device?.name_by_user || device?.name || (isDryer ? 'Сушильная машина' : 'Стиральная машина');
+    $('name').title = $('name').textContent;
     $('drum').classList.toggle('running', status === 'running');
-    if (isDryer) { $('water').setAttribute('hidden', ''); $('bubbles').setAttribute('hidden', ''); }
-    else $('heat').setAttribute('hidden', '');
+    if (isDryer || care) { $('water').setAttribute('hidden', ''); $('bubbles').setAttribute('hidden', ''); }
+    if (!isDryer) $('heat').setAttribute('hidden', '');
     if (progress !== null) {
       $('meter').removeAttribute('hidden');
       $('meter').setAttribute('stroke-dasharray', `${progress} 100`);
@@ -267,12 +273,12 @@ class HaierLaundryCard extends HTMLElement {
     });
     $('status').textContent = remote === null ? 'Нет данных об устройстве' : statusText;
     const phase = this.value('phase');
-    $('phase').textContent = remote !== null && phase && !/^(Код|Code)\s/.test(phase) && phase !== statusText && !(['idle', 'running', 'paused'].includes(status) && phase === 'Режим ожидания') ? phase : '';
+    $('phase').textContent = care ? careName : remote !== null && phase && !/^(Код|Code)\s/.test(phase) && phase !== statusText && !(['idle', 'running', 'paused'].includes(status) && phase === 'Режим ожидания') ? phase : '';
     const current = this.value('current_program');
     const actualName = typeof actualDetails?.program === 'string' && actualDetails.program.trim() ? actualDetails.program : (current === 'Нет активной программы' ? '' : current);
     $('current').textContent = active ? actualName || '' : '';
     const minutes = remainingMinutes;
-    if (active && Number.isFinite(minutes) && minutes >= 0 && minutes <= 10080) {
+    if (active && !care && Number.isFinite(minutes) && minutes >= 0 && minutes <= 10080) {
       const rounded = Math.round(minutes);
       $('remaining').textContent = `Осталось ${String(Math.floor(rounded / 60)).padStart(2, '0')}:${String(rounded % 60).padStart(2, '0')}`;
       if (status === 'running') {
@@ -282,7 +288,7 @@ class HaierLaundryCard extends HTMLElement {
     }
     $('main-view').hidden = !!this.detailsOpen;
     $('details-view').hidden = !this.detailsOpen;
-    $('details-back').hidden = !this.detailsOpen;
+    $('details-back').hidden = false;
     $('show-details').hidden = !active;
     $('program-fields').hidden = active;
     $('show-details').addEventListener('click', () => {
@@ -291,6 +297,17 @@ class HaierLaundryCard extends HTMLElement {
       this.shadowRoot.getElementById('details-back').focus();
     });
     $('details-back').addEventListener('click', () => {
+      if (this.programMenuOpen) {
+        this.programMenuOpen = false;
+        this.programQuery = '';
+        this.render();
+        this.shadowRoot.getElementById('program').focus();
+        return;
+      }
+      if (!this.detailsOpen) {
+        this.dispatchEvent(new CustomEvent('haier-close', { bubbles: true, composed: true }));
+        return;
+      }
       this.detailsOpen = false;
       this.render();
       this.shadowRoot.getElementById('show-details').focus();
@@ -508,7 +525,7 @@ class HaierLaundryCard extends HTMLElement {
     $('start-label').textContent = uncertain ? 'Запуск / отмена' : active ? 'Отменить' : 'Запустить';
     $('toggle-icon').setAttribute('icon', action === 'resume' ? 'mdi:play' : 'mdi:pause');
     $('toggle-label').textContent = action === 'resume' ? 'Продолжить' : action === 'pause' ? 'Пауза' : 'Пауза / продолжить';
-    $('note').textContent = !connected ? 'Управление недоступно, пока нет связи или выключен удалённый доступ.' : !status ? 'Состояние цикла не получено. Выберите действие вручную.' : ['finished', 'cancelled'].includes(status) ? 'Для запуска дождитесь подтверждённого режима ожидания.' : active ? 'Отмена требует подтверждения.' : 'Запуск требует подтверждения.';
+    $('note').textContent = !connected ? 'Управление недоступно, пока нет связи или выключен удалённый доступ.' : !status ? 'Состояние цикла не получено. Выберите действие вручную.' : ['finished', 'cancelled'].includes(status) ? 'Для запуска дождитесь подтверждённого режима ожидания.' : care ? (laundryReady ? 'Бельё готово. Отмена ухода требует подтверждения.' : 'Отмена ухода требует подтверждения.') : active ? 'Отмена требует подтверждения.' : 'Запуск требует подтверждения.';
     $('error').textContent = this.error;
     const start = () => {
       if (canStart && window.confirm(`Запустить программу «${selected}»?`)) this.send('haier_evo', 'execute_action', { entity_id: c.machine, action: 'start' });
@@ -545,7 +562,7 @@ class HaierLaundryCard extends HTMLElement {
       }
       settingFocusTarget.focus({ preventScroll: true });
     }
-    if (focused?.id === 'details-back') $(active && this.detailsOpen ? 'details-back' : 'program').focus({ preventScroll: true });
+    if (focused?.id === 'details-back') $('details-back').focus({ preventScroll: true });
     if (searchFocused && this.programMenuOpen) {
       search.focus({ preventScroll: true });
       if (searchStart !== null && searchEnd !== null) search.setSelectionRange(searchStart, searchEnd);
@@ -657,16 +674,21 @@ async function initializeHaierDetails(attempt = 0) {
       dialog.innerHTML = `<style>
         dialog[data-haier-laundry] { box-sizing: border-box; width: min(520px, calc(100vw - 24px)); max-width: none; max-height: calc(100dvh - 24px); padding: 0; border: 0; border-radius: 18px; background: var(--card-background-color, var(--primary-background-color)); color: var(--primary-text-color); box-shadow: 0 16px 50px #0006; }
         dialog[data-haier-laundry]::backdrop { background: #0009; }
-        dialog[data-haier-laundry] .close { position: sticky; top: 8px; z-index: 1; float: left; width: 40px; height: 40px; margin: 8px -48px -48px 8px; border: 0; border-radius: 50%; background: transparent; color: var(--primary-text-color); cursor: pointer; }
-        dialog[data-haier-laundry] .close:focus-visible { outline: 3px solid var(--primary-color); outline-offset: -3px; }
         dialog[data-haier-laundry] haier-laundry-detail { display: block; }
-      </style><button class="close" type="button" aria-label="Закрыть"><ha-icon icon="mdi:close"></ha-icon></button><haier-laundry-detail></haier-laundry-detail>`;
+      </style><haier-laundry-detail></haier-laundry-detail>`;
       const details = dialog.querySelector('haier-laundry-detail');
-      details.onViewChange = subview => { dialog.querySelector('.close').hidden = subview; };
+      let focusPending = true;
+      details.onViewChange = () => {
+        const navigation = details.shadowRoot?.getElementById('details-back');
+        if (focusPending && dialog.open && navigation) {
+          focusPending = false;
+          navigation.focus();
+        }
+      };
       const icon = root.hass.states[entityId]?.attributes?.icon || '';
       details.setConfig({ device: deviceId, kind: icon.includes('tumble') ? 'dryer' : 'washer' });
       details.hass = root.hass;
-      dialog.querySelector('.close').addEventListener('click', () => dialog.close());
+      dialog.addEventListener('haier-close', () => dialog.close());
       dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
       dialog.addEventListener('haier-show-native', () => {
         dialog.close();
@@ -683,6 +705,7 @@ async function initializeHaierDetails(attempt = 0) {
       dialog.addEventListener('close', () => { unsubscribe?.(); dialog.remove(); }, { once: true });
       document.body.append(dialog);
       dialog.showModal();
+      details.onViewChange();
       event.preventDefault();
       event.stopImmediatePropagation();
     } catch (_) {

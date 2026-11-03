@@ -29,7 +29,7 @@ const classes = new Map();
 classes.set('home-assistant', class {});
 let confirm = false;
 const context = {
-  HTMLElement, document: { createElement: () => new Element(), querySelector: () => null },
+  HTMLElement, CustomEvent, document: { createElement: () => new Element(), querySelector: () => null },
   window: { confirm: () => confirm, customCards: [] },
   customElements: { define: (name, klass) => classes.set(name, klass), get: name => classes.get(name) },
   setTimeout: () => {},
@@ -198,7 +198,7 @@ test('registration waits for the Home Assistant registry', () => {
   const registry = new Map();
   let retry;
   const sandbox = {
-    HTMLElement, document: context.document, window: { customCards: [] },
+    HTMLElement, CustomEvent, document: context.document, window: { customCards: [] },
     customElements: { define: (name, klass) => registry.set(name, klass), get: name => registry.get(name) },
     setTimeout: callback => { retry = callback; },
   };
@@ -445,5 +445,88 @@ test('settings errors are shown only for the selected program; active cycles dis
   const control = card.shadowRoot.getElementById('settings-grid').children[0].children[1];
   assert.equal(control.disabled, true);
   control.value = '60'; control.events.change();
+  assert.equal(calls.length, 0);
+});
+
+
+test('one header navigation control closes the main view and goes back from details', async () => {
+  const { card } = await fixture('running');
+  const events = [];
+  card.dispatchEvent = event => events.push(event.type);
+  assert.match(card.shadowRoot.html, /grid-template-columns: 40px minmax\(0, 1fr\) 44px/);
+  assert.match(card.shadowRoot.html, /text-overflow: ellipsis/);
+  assert.match(card.shadowRoot.html, /id="details-back" aria-label="Закрыть"/);
+  assert.equal(card.shadowRoot.getElementById('details-back').hidden, false);
+  card.shadowRoot.getElementById('details-back').click();
+  assert.deepEqual(events, ['haier-close']);
+  card.shadowRoot.getElementById('show-details').click();
+  assert.match(card.shadowRoot.html, /id="details-back" aria-label="Назад"/);
+  card.shadowRoot.getElementById('details-back').click();
+  assert.equal(card.detailsOpen, false);
+  assert.deepEqual(events, ['haier-close']);
+});
+
+
+test('catalog header back closes the list and restores focus without closing the device', async () => {
+  const { card, calls } = await fixture('idle');
+  const events = [];
+  card.dispatchEvent = event => events.push(event.type);
+  card.shadowRoot.getElementById('program').click();
+  assert.match(card.shadowRoot.html, /id="details-back" aria-label="Назад"/);
+  card.programQuery = 'cotton';
+  card.shadowRoot.getElementById('details-back').click();
+  assert.equal(card.programMenuOpen, false);
+  assert.equal(card.programQuery, '');
+  assert.equal(card.shadowRoot.activeElement.id, 'program');
+  assert.deepEqual(events, []);
+  assert.equal(calls.length, 0);
+});
+
+
+test('post-wash care is ready without a misleading one-minute countdown or next-run controls', async () => {
+  const { card, states, hass, calls } = await fixture('care');
+  card.config.kind = 'washer';
+  states['haier_evo.machine_machine'].attributes.available_actions = ['cancel'];
+  states['haier_evo.machine_machine'].attributes.laundry_ready = true;
+  states['haier_evo.machine_machine'].attributes.care_name = 'Fresh Air System';
+  states['haier_evo.machine_machine'].attributes.active_program_details = {
+    program: 'Mixed', remaining_minutes: 1, total_minutes: 44, fields: [],
+  };
+  card.hass = hass;
+  const get = id => card.shadowRoot.getElementById(id);
+  assert.equal(get('status').textContent, 'Основная стирка завершена');
+  assert.equal(get('phase').textContent, 'Fresh Air System');
+  assert.match(get('note').textContent, /Бельё готово/);
+  assert.equal(get('remaining').textContent || '', '');
+  assert.equal(get('completion').textContent || '', '');
+  assert.equal(get('meter').attributes['stroke-dasharray'], undefined);
+  assert.equal(get('water').attributes.hidden, '');
+  assert.equal(get('program-fields').hidden, true);
+  assert.equal(get('program-settings').hidden, true);
+  assert.equal(get('start-label').textContent, 'Отменить');
+  assert.equal(get('start').disabled, false);
+  assert.equal(get('toggle').disabled, true);
+  assert.equal(calls.length, 0);
+  states['haier_evo.machine_machine'].attributes.available_actions = ['pause', 'cancel'];
+  card.hass = hass;
+  assert.equal(get('toggle').disabled, false);
+  await get('toggle').click();
+  assert.equal(calls[0][2].action, 'pause');
+});
+
+
+test('dryer post-program care uses the declared name and machine kind with a neutral fallback', async () => {
+  const { card, states, hass, calls } = await fixture('care');
+  card.config.kind = 'washer';
+  const attributes = states['haier_evo.machine_machine'].attributes;
+  attributes.machine_kind = 'dryer';
+  attributes.care_name = 'Антисминание';
+  attributes.available_actions = ['cancel'];
+  card.hass = hass;
+  assert.equal(card.shadowRoot.getElementById('status').textContent, 'Основная сушка завершена');
+  assert.equal(card.shadowRoot.getElementById('phase').textContent, 'Антисминание');
+  attributes.care_name = '';
+  card.hass = hass;
+  assert.equal(card.shadowRoot.getElementById('phase').textContent, 'Уход после программы');
   assert.equal(calls.length, 0);
 });

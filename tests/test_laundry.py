@@ -185,6 +185,63 @@ def control_fixture():
     }
 
 
+def care_fixture(postcare=False):
+    data = control_fixture()
+    monitor = data["allProgram"]["monitoringScreen"]
+    monitor["freshAirSystem"] = {"freshAirSystemAttrValue": "care-code", "title": "Fresh Air System"}
+    monitor["timer"] = {"remainingTimeHH": {"name": "care-hours"}, "remainingTimeMM": {"name": "care-minutes"}}
+    data["smartDeviceControl"]["attributes"][1]["currentValue"] = "care-code" if postcare else "wash-code"
+    data["smartDeviceControl"]["attributes"] += [
+        {"name": "care-hours", "currentValue": "0", "readable": True},
+        {"name": "care-minutes", "currentValue": "1" if postcare else "20", "readable": True}]
+    data["program"] = {"status": "IN_PROGRESS", "title": "Cotton"}
+    return data
+
+
+def test_postcare_uses_the_declared_phase_and_keeps_real_runtime_actions():
+    cloud, device = create("WM", care_fixture(postcare=True))
+    assert device.in_postcare and device.laundry_ready
+    assert device.program_status == "running"
+    assert set(device.available_actions) == {"pause", "cancel"}
+    device.set_selected_program("Fabric - Cotton")
+    device._program_status = None
+    with pytest.raises(HomeAssistantError, match="до запуска"):
+        device.configure_program("Fabric - Cotton", {"unused": "value"})
+    device.values["18"] = "different-code"
+    assert not device.in_postcare
+    data = care_fixture(postcare=True)
+    data["allProgram"]["monitoringScreen"].pop("freshAirSystem")
+    _, undeclared = create("WM", data)
+    assert not undeclared.in_postcare
+    cloud.socket_app.send.assert_not_called()
+
+
+@pytest.mark.parametrize(("declared", "observed"), [("", ""), ("None", None), (True, True)])
+def test_missing_or_invalid_postcare_phase_is_not_readiness(declared, observed):
+    data = care_fixture()
+    data["allProgram"]["monitoringScreen"]["freshAirSystem"]["freshAirSystemAttrValue"] = declared
+    data["smartDeviceControl"]["attributes"][1]["currentValue"] = observed
+    _, device = create("WM", data)
+    assert not device.in_postcare and not device.laundry_ready
+
+
+@pytest.mark.parametrize("send_fails", [False, True])
+def test_only_a_successfully_sent_explicit_start_resets_the_completion_latch(send_fails):
+    cloud, device = create("WM", care_fixture(postcare=True))
+    device.on_message({"event": "status", "payload": {"statuses": [{"properties": {"18": "0"}}]}})
+    device._program_status = None
+    device.set_selected_program("Fabric - Cotton")
+    if send_fails:
+        cloud.socket_app.send.side_effect = OSError("synthetic send failure")
+        with pytest.raises(HomeAssistantError):
+            device.send_laundry_action("start")
+        assert device.laundry_ready
+    else:
+        device.send_laundry_action("start")
+        assert not device.laundry_ready and not device._main_cycle_confirmed
+    assert cloud.socket_app.send.call_count == 1
+
+
 def test_selection_is_local_and_start_requires_explicit_action():
     cloud, device = create("WM", control_fixture())
     assert list(device.programs) == ["Fabric - Cotton"]
@@ -488,3 +545,30 @@ def test_program_events_keep_current_parameters_separate_from_next_selection():
         "status": "IN_PROGRESS", "title": "Other"}}})
     assert not device._active_program_values
     cloud.socket_app.send.assert_not_called()
+
+
+def test_dryer_reads_single_remaining_dry_time_and_declared_postcare():
+    data = {"smartDeviceControl": {"status": "ONLINE", "attributes": [
+        {"name": "phase", "readable": True, "currentValue": "2"},
+        {"name": "dry-left", "readable": True, "currentValue": "40"}]},
+        "device": {"monitoringScreen": {"timer": {"remainingDryTime": {"name": "dry-left"}},
+            "phase": {"phase": {"name": "phase"}, "antiCrease": {
+                "statusTitle": "Антисминание", "cyclePhaseValue": "7"}}}}}
+    cloud, device = create("DRY", data)
+    assert device.remaining_time == 40
+    assert "remaining_time" in {s._device_attr_name for s in device.create_entities_sensor()}
+    device.values["dry-left"] = True
+    assert device.remaining_time is None
+    device.values["phase"] = "7"
+    assert device.in_postcare and device.postcare_name == "Антисминание"
+    cloud.socket_app.send.assert_not_called()
+
+
+def test_zero_phase_mapping_requires_declared_haier_cycle_phase_semantics():
+    data = control_fixture()
+    phase = data["allProgram"]["monitoringScreen"]["phase"]
+    phase["cyclePhaseValueToTitle"] = {}
+    phase["description"] = "cyclePhase"
+    assert create("WM", data)[1].program_status == "idle"
+    phase["description"] = "customPhase"
+    assert create("WM", data)[1].program_status is None

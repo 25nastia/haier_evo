@@ -9,7 +9,7 @@ from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.haier_evo import api
 from custom_components.haier_evo.machine import async_setup_machines
-from test_laundry import FakeCloud, control_fixture
+from test_laundry import FakeCloud, care_fixture, control_fixture
 
 
 @pytest.mark.asyncio
@@ -106,6 +106,7 @@ async def test_observed_washer_finish_and_alarm_events_are_deduplicated(hass, en
     await hass.async_block_till_done()
     assert len(events) == 2
     assert events[1]["type"] == "program_finished"
+    assert events[1]["completion_reason"] == "program"
     assert events[1]["program"] == "Смешанная"
     assert events[1]["errors"][0]["code"] == "E2"
 
@@ -210,6 +211,144 @@ async def test_stage_finished_followed_by_running_does_not_publish_cycle_finishe
     device.on_message({"event": "ProgramWasherBaseEvent", "data": {
         "program": {"status": "FINISHED", "title": "Mixed"}}})
     await hass.async_block_till_done()
+    await platform.async_destroy()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=22))
+    await hass.async_block_till_done()
+    assert not events and device._finish_unsub is None
+    cloud.socket_app.send.assert_not_called()
+
+
+async def setup_care_machine(hass, data):
+    entry = MockConfigEntry(domain="haier_evo", data={})
+    entry.add_to_hass(hass)
+    cloud = FakeCloud(data)
+    cloud.hass = hass
+    device = api.HaierDevice.create(cloud, "WM", "synthetic-device", device_title="Machine")
+    cloud.devices = [device]
+    hass.data.setdefault("haier_evo", {})[entry.entry_id] = cloud
+    events = []
+    hass.bus.async_listen("haier_evo_laundry_event", lambda event: events.append(event.data))
+    platform = await async_setup_machines(hass, entry)
+    await hass.async_block_till_done()
+    return cloud, device, platform, events
+
+
+def phase_message(phase, minutes):
+    return {"event": "status", "payload": {"statuses": [{"properties": {
+        "18": phase, "care-minutes": str(minutes)}}]}}
+
+
+def program_pulse(device, suffix):
+    for status, native in (("PROGRAM_FINISHED", "FINISHED"), ("PROGRAM_STARTED", "IN_PROGRESS")):
+        device.on_message({"event": "ProgramWasherBaseEvent", "trace": f"{suffix}-{status}",
+                           "data": {"status": status, "program": {
+                               "id": f"synthetic-{suffix}-{status}", "status": native, "title": "Cotton"}}})
+
+
+@pytest.mark.asyncio
+async def test_postcare_confirms_ready_once_despite_new_programme_ids(hass, enable_custom_integrations):
+    cloud, device, platform, events = await setup_care_machine(hass, care_fixture())
+    device.on_message(phase_message("care-code", 1))
+    program_pulse(device, "first")
+    await hass.async_block_till_done()
+    state = hass.states.get(device.machine_entity_id)
+    assert state.state == "care" and state.attributes["laundry_ready"] is True
+    assert device.program_status == "running" and set(device.available_actions) == {"pause", "cancel"}
+    assert platform.platform_data.platform_translations["component.haier_evo.entity.haier_evo.laundry_machine.state.care"] == "Post-cycle care"
+    assert not events
+    pending = device._finish_unsub
+    program_pulse(device, "before-confirmation")
+    await hass.async_block_till_done()
+    assert device._finish_unsub is pending
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert len(events) == 1 and events[0]["completion_reason"] == "post_care"
+    for index in range(3):
+        program_pulse(device, f"repeat-{index}")
+        device.on_message(phase_message("care-code", 1))
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=40))
+    await hass.async_block_till_done()
+    assert len(events) == 1
+    cloud.socket_app.send.assert_not_called()
+    await platform.async_destroy()
+
+
+@pytest.mark.asyncio
+async def test_initial_postcare_does_not_repeat_an_old_completion(hass, enable_custom_integrations):
+    cloud, device, platform, events = await setup_care_machine(hass, care_fixture(postcare=True))
+    program_pulse(device, "restored")
+    device.on_message(phase_message("care-code", 1))
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert device.laundry_ready and not events and device._finish_unsub is None
+    cloud.socket_app.send.assert_not_called()
+    await platform.async_destroy()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_finish_then_new_started_resets_without_declared_idle(hass, enable_custom_integrations):
+    data = control_fixture()
+    data["allProgram"]["monitoringScreen"]["phase"].pop("cyclePhaseValueToTitle")
+    cloud, device, platform, events = await setup_care_machine(hass, data)
+    for cycle in range(2):
+        device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+            "status": "PROGRAM_STARTED", "program": {"status": "IN_PROGRESS", "title": "Cotton"}}})
+        assert not device.laundry_ready
+        device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+            "status": "PROGRAM_FINISHED", "program": {"status": "FINISHED", "title": "Cotton"}}})
+        await hass.async_block_till_done()
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11 * (cycle + 1)))
+        await hass.async_block_till_done()
+        assert len(events) == cycle + 1 and device.laundry_ready
+        assert events[-1]["completion_reason"] == "program"
+    cloud.socket_app.send.assert_not_called()
+    await platform.async_destroy()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["idle", "started"])
+async def test_next_confirmed_cycle_can_publish_one_more_ready(hass, enable_custom_integrations, boundary):
+    cloud, device, platform, events = await setup_care_machine(hass, care_fixture())
+    device.on_message(phase_message("care-code", 1))
+    program_pulse(device, "first-cycle")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert len(events) == 1
+    if boundary == "idle":
+        device.on_message(phase_message("0", 0))
+    device.on_message(phase_message("wash-code", 40))
+    if boundary == "started":
+        assert device.laundry_ready
+        device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+            "status": "PROGRAM_STARTED", "program": {"status": "IN_PROGRESS", "title": "Cotton"}}})
+    assert not device.laundry_ready
+    device.on_message(phase_message("care-code", 1))
+    program_pulse(device, "second-cycle")
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=22))
+    await hass.async_block_till_done()
+    assert len(events) == 2 and all(event["completion_reason"] == "post_care" for event in events)
+    cloud.socket_app.send.assert_not_called()
+    await platform.async_destroy()
+
+
+@pytest.mark.asyncio
+async def test_postcare_must_stay_observed_and_unload_cancels_confirmation(hass, enable_custom_integrations):
+    cloud, device, platform, events = await setup_care_machine(hass, care_fixture())
+    device.on_message(phase_message("care-code", 1))
+    await hass.async_block_till_done()
+    assert device._finish_unsub is not None
+    device.on_message(phase_message("wash-code", 20))
+    await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert not events
+    device.on_message(phase_message("care-code", 1))
+    await hass.async_block_till_done()
+    assert device._finish_unsub is not None
     await platform.async_destroy()
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=22))
     await hass.async_block_till_done()

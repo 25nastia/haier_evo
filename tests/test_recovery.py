@@ -14,7 +14,7 @@ from requests.exceptions import HTTPError, Timeout
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from custom_components.haier_evo import api
 from custom_components.haier_evo.coordinator import HaierLaundryCoordinator
-from test_laundry import create, control_fixture, FakeCloud
+from test_laundry import create, care_fixture, control_fixture, FakeCloud
 
 
 def test_offline_then_online_needs_and_accepts_full_snapshot():
@@ -202,6 +202,19 @@ def test_snapshot_recovers_missed_finish_after_a_socket_outage_once():
     device.apply_snapshot(finished, device._state_revision)
     device.apply_snapshot(finished, device._state_revision)
     device._fire_laundry_event.assert_called_once_with("program_finished")
+
+
+def test_snapshot_recovers_declared_postcare_without_waiting_for_another_finished_push():
+    cloud, device = create("WM", care_fixture())
+    device.machine_entity_id = "haier_evo.synthetic"
+    device._fire_laundry_event = Mock()
+    device.mark_stale()
+    postcare = care_fixture(postcare=True)
+    assert device.apply_snapshot(postcare, device._state_revision)
+    assert device.in_postcare and device.program_status == "running"
+    device.apply_snapshot(postcare, device._state_revision)
+    device._fire_laundry_event.assert_called_once_with("program_finished")
+    cloud.socket_app.send.assert_not_called()
 
 
 def test_partial_snapshot_program_preserves_confirmed_running_cycle():

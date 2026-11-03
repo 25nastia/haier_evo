@@ -1624,6 +1624,16 @@ class HaierLaundry(HaierDevice):
         phase = monitor.get("phase") or {}
         self.phase_key = (phase.get("phase") or phase).get("name")
         self.phase_labels = dict(phase.get("cyclePhaseValueToTitle") or {})
+        phase_descriptor = phase.get("phase") or phase
+        if isinstance(phase_descriptor, dict) and phase_descriptor.get("description") == "cyclePhase":
+            language = getattr(self.hass.config, "language", "en")
+            self.phase_labels.setdefault("0", "Режим ожидания" if isinstance(language, str) and language.startswith("ru") else "Standby")
+        postcare = monitor.get("freshAirSystem") or (phase.get("antiCrease") if self.is_dryer else {}) or {}
+        postcare_phase = (postcare.get("freshAirSystemAttrValue", postcare.get("cyclePhaseValue"))
+                          if isinstance(postcare, dict) else None)
+        self.postcare_name = (postcare.get("title") or postcare.get("statusTitle")) if isinstance(postcare, dict) else None
+        self._postcare_phase = (str(postcare_phase) if isinstance(postcare_phase, (str, int))
+                                and not isinstance(postcare_phase, bool) and str(postcare_phase).strip() else None)
         for key, value_key in (("weighing", "weightAttrValue"),
                                ("finishing", "finishingAttrValue"),
                                ("freshAirSystem", "freshAirSystemAttrValue")):
@@ -1631,6 +1641,7 @@ class HaierLaundry(HaierDevice):
             if isinstance(description, dict) and description.get(value_key) is not None and description.get("title"):
                 self.phase_labels[str(description[value_key])] = description["title"]
         timer = monitor.get("timer") or {}
+        self.dry_minutes_key = (timer.get("remainingDryTime") or {}).get("name")
         self.hours_key = (timer.get("remainingTimeHH") or {}).get("name")
         self.minutes_key = (timer.get("remainingTimeMM") or {}).get("name")
         program = data.get("program")
@@ -1644,6 +1655,10 @@ class HaierLaundry(HaierDevice):
         self.available = observed_status if observed_status in (True, False, "ONLINE", "OFFLINE") else False
         self._status_data = data
         self._cycle_active = self.program_status in ("running", "paused")
+        self._completion_reason = "post_care" if self.in_postcare else None
+        self._main_cycle_confirmed = self._cycle_active and not self.in_postcare
+        self._idle_since_completion = False
+        self._postcare_remaining = self.remaining_time if self.in_postcare else None
 
     @property
     def available(self) -> bool:
@@ -1692,11 +1707,59 @@ class HaierLaundry(HaierDevice):
     @property
     def remaining_time(self) -> int | None:
         try:
+            if self.dry_minutes_key is not None:
+                raw = self.values[str(self.dry_minutes_key)]
+                if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                    return None
+                minutes = int(raw)
+                return minutes if minutes >= 0 else None
             hours = int(self.values[str(self.hours_key)])
             minutes = int(self.values[str(self.minutes_key)])
             return hours * 60 + minutes if hours >= 0 and 0 <= minutes < 60 else None
         except (KeyError, TypeError, ValueError):
             return None
+
+    @property
+    def in_postcare(self) -> bool:
+        phase = self.values.get(str(self.phase_key))
+        return (self.fresh and phase is not None and self._postcare_phase is not None
+                and str(phase) == self._postcare_phase)
+
+    @property
+    def laundry_ready(self) -> bool:
+        return self.in_postcare or self._completion_reason is not None
+
+    def _observe_cycle(self, was_postcare: bool, *, started: bool = False, previous_name: str | None = None) -> None:
+        if was_postcare and not self.in_postcare:
+            self.hass.loop.call_soon_threadsafe(self.cancel_pending_finish)
+        if self.in_postcare:
+            self._postcare_remaining = self.remaining_time
+            if not was_postcare and self._main_cycle_confirmed and self._completion_reason is None:
+                self._fire_laundry_event("program_finished")
+            return
+        phase = self.values.get(str(self.phase_key))
+        idle = (str(phase) == "0"
+                and str(self.phase_labels.get("0", "")).casefold() in ("режим ожидания", "standby", "idle"))
+        active = self.program_status in ("running", "paused")
+        if self._completion_reason is not None:
+            if idle:
+                self._idle_since_completion = True
+            remaining = self.remaining_time
+            new_program = bool(previous_name and self.program_name and self.program_name != previous_name)
+            restarted = (self._completion_reason == "post_care" and self._postcare_remaining in (0, 1)
+                         and remaining is not None and remaining > 1 and (started or new_program))
+            program_started = self._completion_reason == "program" and started
+            if not (active and (program_started or (phase is not None and not idle
+                                                   and (self._idle_since_completion or restarted)))):
+                return
+            self._completion_reason = None
+            self._idle_since_completion = False
+            self._postcare_remaining = None
+            self._last_finished_trace = None
+        if active:
+            self._main_cycle_confirmed = True
+        elif self.program_status == "cancelled":
+            self._main_cycle_confirmed = False
 
     def request_snapshot(self) -> None:
         if self.recovery is not None:
@@ -1715,6 +1778,7 @@ class HaierLaundry(HaierDevice):
             self._program_name = None
             self.selected_program = None
             self.alarm_codes = None
+        self.hass.loop.call_soon_threadsafe(self.cancel_pending_finish)
         self.write_ha_state()
 
     def apply_snapshot(self, data: dict, revision: int) -> bool:
@@ -1736,6 +1800,8 @@ class HaierLaundry(HaierDevice):
         with self._laundry_lock:
             if revision != self._state_revision:
                 return False
+            was_postcare = self.in_postcare
+            previous_name = self.program_name
             was_active = self._cycle_active or self.program_status in ("running", "paused")
             previous = self.program_status
             previous_phase = self.values.get(str(self.phase_key))
@@ -1772,10 +1838,12 @@ class HaierLaundry(HaierDevice):
                     self._program_name = None
             if online and self._start_pending and str(values.get(str(self.phase_key))) != str(self._start_phase):
                 self._start_pending = False
-            if online and was_active and self.program_status == "finished":
+            if online and was_active and self.program_status == "finished" and not self.in_postcare:
                 self._fire_laundry_event("program_finished")
             if online and self.program_status is not None:
                 self._cycle_active = self.program_status in ("running", "paused")
+            if online:
+                self._observe_cycle(was_postcare, previous_name=previous_name)
             if online and codes is not None and codes != self._last_notified_alarms:
                 had_errors = bool(self._last_notified_alarms)
                 self._last_notified_alarms = codes
@@ -1797,6 +1865,7 @@ class HaierLaundry(HaierDevice):
             return
         was_fresh = self.fresh
         with self._laundry_lock:
+            was_postcare = self.in_postcare
             self._state_revision += 1
             self._last_observed = time.monotonic()
             phase = str(self.phase_key)
@@ -1810,6 +1879,7 @@ class HaierLaundry(HaierDevice):
                 self._set_attribute_value(code, value)
             self.fresh = True
             self.available = True
+            self._observe_cycle(was_postcare)
         self.write_ha_state()
         self._push_updated()
         if not was_fresh:
@@ -1852,6 +1922,8 @@ class HaierLaundry(HaierDevice):
     def _fire_laundry_event(self, event_type: str) -> None:
         if not self.machine_entity_id:
             return
+        if event_type == "program_finished" and self._completion_reason is not None:
+            return
         event = {
             "type": event_type, "entity_id": self.machine_entity_id,
             "name": self.device_name, "model": self.device_model,
@@ -1870,7 +1942,7 @@ class HaierLaundry(HaierDevice):
 
     def _schedule_finish_confirmation(self, event: dict) -> None:
         from homeassistant.helpers.event import async_call_later
-        if self.recovery is None:
+        if self.recovery is None or self._completion_reason is not None:
             return
         self.cancel_pending_finish()
 
@@ -1878,9 +1950,19 @@ class HaierLaundry(HaierDevice):
         def confirm(_now):
             self._finish_unsub = None
             # Evo can finish a stage and immediately report the same cycle running again.
-            if self.available and not self._cycle_active and self.program_status != "cancelled":
+            with self._laundry_lock:
+                postcare = self.in_postcare and self._main_cycle_confirmed
+                if (self.recovery is None or not self.available or self._completion_reason is not None
+                        or not (postcare or (not self._cycle_active and self.program_status != "cancelled"))):
+                    return
+                self._completion_reason = "post_care" if postcare else "program"
+                self._main_cycle_confirmed = False
+                event["completion_reason"] = self._completion_reason
+                if postcare:
+                    event["care_name"] = self.postcare_name
                 event["errors"] = self.error_details or []
-                self.hass.bus.async_fire("haier_evo_laundry_event", event)
+            self.hass.bus.async_fire("haier_evo_laundry_event", event)
+            self.write_ha_state()
 
         self._finish_unsub = async_call_later(self.hass, 10, confirm)
 
@@ -1917,6 +1999,8 @@ class HaierLaundry(HaierDevice):
             program = data.get("program") if isinstance(data, dict) else None
             if isinstance(program, dict) or (isinstance(data, dict) and data.get("status") == "PROGRAM_FINISHED"):
                 with self._laundry_lock:
+                    was_postcare = self.in_postcare
+                    previous_name = self.program_name
                     self._state_revision += 1
                     self._last_observed = time.monotonic()
                     previous = self.program_status
@@ -1937,12 +2021,14 @@ class HaierLaundry(HaierDevice):
                     trace = message_dict.get("trace")
                     if self.program_status in ("running", "paused"):
                         self._cycle_active = True
-                    if (self.program_status == "finished" and previous != "finished"
+                    if (self.program_status == "finished" and previous != "finished" and not self.in_postcare
                             and (not trace or trace != self._last_finished_trace)):
                         self._last_finished_trace = trace
                         self._fire_laundry_event("program_finished")
                     if self.program_status in ("finished", "cancelled", "idle"):
                         self._cycle_active = False
+                    self._observe_cycle(was_postcare, started=data.get("status") == "PROGRAM_STARTED",
+                                        previous_name=previous_name)
                 self.write_ha_state()
                 self._push_updated()
             return
@@ -1994,7 +2080,7 @@ class HaierLaundry(HaierDevice):
         with self._laundry_lock:
             if program != self.selected_program or program not in self.programs:
                 raise ServiceValidationError("Выбранная программа изменилась; откройте параметры заново")
-            if self._start_pending or self.program_status in ("running", "paused"):
+            if self._start_pending or self.in_postcare or self.program_status in ("running", "paused"):
                 raise ServiceValidationError("Параметры можно изменить до запуска программы")
             settings = self.program_settings
             editable = {field["key"] for field in settings.get("fields", []) if not field.get("disabled")}
@@ -2045,6 +2131,13 @@ class HaierLaundry(HaierDevice):
                     socket_app.send(json.dumps(message))
                 except Exception as err:
                     raise HomeAssistantError("Не удалось подтвердить отправку команды Haier; проверьте машину") from err
+                if action == "start":
+                    self._completion_reason = None
+                    self._main_cycle_confirmed = False
+                    self._idle_since_completion = False
+                    self._postcare_remaining = None
+                    self._last_finished_trace = None
+                    self.hass.loop.call_soon_threadsafe(self.cancel_pending_finish)
         finally:
             if action == "start":
                 self.write_ha_state()
@@ -2080,7 +2173,7 @@ class HaierLaundry(HaierDevice):
         if self.phase_key is not None:
             key = "laundry_phase" if self.is_dryer else "laundry_phase_code"
             entities.append(HaierLaundrySensor(self, "phase", key))
-        if self.hours_key is not None and self.minutes_key is not None:
+        if self.dry_minutes_key is not None or (self.hours_key is not None and self.minutes_key is not None):
             entities.append(HaierLaundrySensor(self, "remaining_time", "laundry_program_time"))
         entities.append(HaierLaundrySensor(self, "program_status", "laundry_program_status"))
         entities.append(HaierLaundrySensor(self, "program_name", "laundry_program_name"))

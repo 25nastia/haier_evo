@@ -77,12 +77,16 @@ class HaierLaundryEntity(Entity):
 
     @property
     def state(self):
+        if self._device.in_postcare:
+            return "care"
         return self._device.program_status or "not_reported"
 
     @property
     def extra_state_attributes(self):
         return {
             "machine_kind": "dryer" if self._device.is_dryer else "washer",
+            "laundry_ready": self._device.laundry_ready,
+            "care_name": self._device.postcare_name if self._device.in_postcare else None,
             "available_actions": self._device.available_actions,
             "connection_status": self._device.connection_status if self._device.available else None,
             "program_catalog": self._device.program_catalog,
