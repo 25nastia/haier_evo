@@ -59,6 +59,12 @@ class HaierLaundryCoordinator(DataUpdateCoordinator[None]):
                 self._schedule_refresh()
 
     async def _async_update_data(self):
+        required = {str(key) for key in (self.device.phase_key, self.device.remote_key) if key is not None}
+        if (self.device.available and self.device.program_status in ("running", "paused")
+                and required.issubset(self.device.values)
+                and time.monotonic() - self.device._last_observed < 180):
+            self.update_interval = self.normal_interval
+            return
         async with self.cloud._laundry_poll_lock:
             if self._closed or getattr(self.cloud, "disconnect_requested", False):
                 return
@@ -99,12 +105,14 @@ class HaierLaundryCoordinator(DataUpdateCoordinator[None]):
                 self.update_interval = timedelta(seconds=delay)
                 if time.monotonic() - self.device._last_observed > 300:
                     self.device.mark_stale()
-                raise UpdateFailed("Unable to refresh Haier laundry state", retry_after=delay) from err
+                reason = str(err) if isinstance(err, ValueError) else type(err).__name__
+                raise UpdateFailed(f"Unable to refresh Haier laundry state: {reason}", retry_after=delay) from err
             self._failures = 0
             self._retry_until = 0.0
             self.update_interval = self.normal_interval
 
     async def async_shutdown(self):
         self._closed = True
+        self.device.cancel_pending_finish()
         self.device.recovery = None
         await super().async_shutdown()

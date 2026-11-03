@@ -381,3 +381,110 @@ def test_start_stays_pending_after_event_without_confirmed_status():
     with pytest.raises(HomeAssistantError):
         device.send_laundry_action("start")
     assert cloud.socket_app.send.call_count == 1
+
+
+def dynamic_delay_fixture():
+    data = control_fixture()
+    data["controlBlock"]["delayStart"] = {
+        "link": {"name": "delay-hours"}, "statusLink": {"name": "schedule-enabled"}}
+    data["smartDeviceControl"]["attributes"].append({
+        "name": "schedule-enabled", "writable": True,
+        "defaultValue": "true", "currentValue": "0",
+        "list": {"data": [{"data": "false"}, {"data": "true"}]}})
+    data["smartDeviceControl"]["groupCommands"][0]["attrNameList"] += ["delay-hours", "schedule-enabled"]
+    data["smartDeviceControl"]["businessAttributes"][0]["commandParameters"]["attrNameList"] += [
+        {"name": "delay-hours", "defaultValue": "0.0"},
+        {"name": "schedule-enabled", "valueType": "2"}]
+    return data
+
+
+def test_dynamic_delay_flag_uses_explicit_immediate_start_not_attribute_default():
+    cloud, device = create("WM", dynamic_delay_fixture())
+    commands = device.programs["Fabric - Cotton"]["commands"]
+    assert commands[-2:] == [
+        {"commandName": "delay-hours", "value": "0.0"},
+        {"commandName": "schedule-enabled", "value": "false"}]
+    cloud.socket_app.send.assert_not_called()
+
+
+@pytest.mark.parametrize("invalid", ["unlinked", "read_only", "nonzero_delay", "missing_delay",
+                                      "wrong_type", "invalid_choice", "duplicate_attribute"])
+def test_dynamic_delay_does_not_fill_other_unknown_or_scheduled_parameters(invalid):
+    data = dynamic_delay_fixture()
+    fields = data["smartDeviceControl"]["businessAttributes"][0]["commandParameters"]["attrNameList"]
+    attribute = data["smartDeviceControl"]["attributes"][-1]
+    if invalid == "unlinked":
+        data["controlBlock"]["delayStart"]["statusLink"]["name"] = "other"
+    elif invalid == "read_only":
+        attribute["writable"] = False
+    elif invalid == "nonzero_delay":
+        fields[-2]["defaultValue"] = "3.0"
+    elif invalid == "missing_delay":
+        fields[-2].pop("defaultValue")
+    elif invalid == "wrong_type":
+        fields[-1]["valueType"] = "3"
+    elif invalid == "invalid_choice":
+        attribute["list"]["data"] = [{"data": "true"}]
+    else:
+        data["smartDeviceControl"]["attributes"].append(attribute.copy())
+    cloud, device = create("WM", data)
+    assert not device.programs
+    cloud.socket_app.send.assert_not_called()
+
+
+@pytest.mark.parametrize("key", ["link", "statusLink"])
+def test_malformed_delay_descriptor_does_not_break_other_programs(key):
+    data = dynamic_delay_fixture()
+    data["controlBlock"]["delayStart"][key] = "unexpected"
+    assert not create("WM", data)[1].programs
+    fields = data["smartDeviceControl"]["businessAttributes"][0]["commandParameters"]["attrNameList"]
+    fields[-1]["valueType"] = "1"
+    fields[-1]["defaultValue"] = "false"
+    assert "Fabric - Cotton" in create("WM", data)[1].programs
+
+
+def test_configuring_dependency_rejects_locked_edits_and_restores_local_preference():
+    data = control_fixture()
+    fields = data["smartDeviceControl"]["businessAttributes"][0]["commandParameters"]["attrNameList"]
+    fields[0].update({"valueType": "3", "defaultValue": "60", "valueRange": {
+        "list": {"type": "LIST", "data": [{"data": "30"}, {"data": "60"}]}}})
+    fields[1].update({"valueType": "3", "defaultValue": "false", "valueRange": {
+        "list": {"type": "LIST", "data": [{"data": "false"}, {"data": "true"}]}}})
+    data["enrichAttributes"] = {"attrs": {"20": {"title": "Temperature"}, "21": {"title": "Steam"}}}
+    data["smartDeviceControl"]["modifiers"] = [{"priority": 1, "trigger": {
+        "operator": "AND", "conditions": {"condition": [{"mode": "21", "values": ["true"]}]}},
+        "actions": [{"name": "20", "rewriteFields": "WD", "writable": False, "defaultValue": "60"}]}]
+    cloud, device = create("WM", data)
+    device.set_selected_program("Fabric - Cotton")
+    device.configure_program("Fabric - Cotton", {"20": "30"})
+    device.configure_program("Fabric - Cotton", {"21": "true"})
+    temp = next(field for field in device.program_settings["fields"] if field["key"] == "20")
+    assert temp["value"] == "60" and temp["disabled"]
+    with pytest.raises(HomeAssistantError):
+        device.configure_program("Fabric - Cotton", {"20": "30"})
+    device.configure_program("Fabric - Cotton", {"21": "false"})
+    assert device.program_settings["values"]["20"] == "30"
+    cloud.socket_app.send.assert_not_called()
+
+
+def test_connection_quality_event_does_not_invent_availability_or_warn(caplog):
+    cloud, device = create("WM", control_fixture())
+    device.mark_stale()
+    device.on_message({"event": "deviceConnectionStatusEvent", "payload": {"status": "GOOD"}})
+    assert device.connection_status == "GOOD" and not device.available
+    assert "Got unknown message" not in caplog.text
+    cloud.socket_app.send.assert_not_called()
+
+
+def test_program_events_keep_current_parameters_separate_from_next_selection():
+    cloud, device = create("WM", control_fixture())
+    device.on_message({"event": "ProgramWasherBaseEvent", "data": {"program": {
+        "status": "IN_PROGRESS", "title": "Cotton", "config": {"selectedValues": [
+            {"attrName": "20", "attrValue": "2"}]}}}})
+    assert device._active_program_values == {"20": "2"}
+    device.set_selected_program("Fabric - Cotton")
+    assert device._active_program_values == {"20": "2"}
+    device.on_message({"event": "ProgramWasherBaseEvent", "data": {"program": {
+        "status": "IN_PROGRESS", "title": "Other"}}})
+    assert not device._active_program_values
+    cloud.socket_app.send.assert_not_called()

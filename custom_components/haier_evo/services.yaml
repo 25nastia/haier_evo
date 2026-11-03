@@ -14,3 +14,19 @@ execute_action:
             - pause
             - resume
             - cancel
+
+configure_program:
+  name: Configure laundry program
+  description: Change the selected program parameters locally without starting the appliance.
+  target:
+    entity:
+      domain: haier_evo
+  fields:
+    program:
+      required: true
+      selector:
+        text:
+    parameters:
+      required: true
+      selector:
+        object:

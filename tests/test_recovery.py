@@ -202,3 +202,31 @@ def test_snapshot_recovers_missed_finish_after_a_socket_outage_once():
     device.apply_snapshot(finished, device._state_revision)
     device.apply_snapshot(finished, device._state_revision)
     device._fire_laundry_event.assert_called_once_with("program_finished")
+
+
+def test_partial_snapshot_program_preserves_confirmed_running_cycle():
+    cloud, device = create("WM", control_fixture())
+    device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+        "program": {"status": "IN_PROGRESS", "title": "Mixed"}}})
+    data = control_fixture()
+    data["program"] = {"title": "Mixed"}
+    device.apply_snapshot(data, device._state_revision)
+    assert device.program_status == "running" and device.program_name == "Mixed"
+    cloud.socket_app.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fresh_running_push_avoids_http_poll_and_silence_recovers(hass):
+    cloud, device = create("WM", control_fixture())
+    cloud.hass = hass
+    cloud.read_device_snapshot = Mock(return_value=control_fixture())
+    coordinator = HaierLaundryCoordinator(hass, MockConfigEntry(domain="haier_evo"), device)
+    device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+        "program": {"status": "IN_PROGRESS", "title": "Mixed"}}})
+    await coordinator._async_update_data()
+    cloud.read_device_snapshot.assert_not_called()
+    device._last_observed -= 181
+    await coordinator._async_update_data()
+    cloud.read_device_snapshot.assert_called_once()
+    cloud.socket_app.send.assert_not_called()
+    await coordinator.async_shutdown()

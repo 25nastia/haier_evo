@@ -2,7 +2,6 @@ from __future__ import annotations
 import requests
 import asyncio
 import json
-import math
 import time
 import threading
 import uuid
@@ -16,11 +15,12 @@ from websocket import WebSocketApp, WebSocket
 from requests.exceptions import ConnectionError, Timeout, HTTPError
 from urllib.parse import urlparse, urljoin, parse_qs
 from urllib3.exceptions import NewConnectionError
-from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.components.climate.const import ClimateEntityFeature, HVACMode, SWING_OFF, PRESET_NONE
 from homeassistant.components.http import HomeAssistantView
+from .programs import active_program_details, build_catalogue, program_settings, value_valid as _laundry_value_valid
 from .logger import _LOGGER
 from .limits import ResettableLimits
 from . import config as CFG # noqa
@@ -1444,34 +1444,14 @@ class HaierWM(HaierDevice):
         return entities
 
 
-def _laundry_value_valid(field: dict, value) -> bool:
-    if not isinstance(value, (str, int, float, bool)):
-        return False
-    limits = field.get("valueRange") or {}
-    if not isinstance(limits, dict):
-        return False
-    listing = limits.get("list") or {}
-    ranged = limits.get("range") or {}
-    if not isinstance(listing, dict) or not isinstance(ranged, dict):
-        return False
-    choices = listing.get("data") or []
-    if not isinstance(choices, list):
-        return False
-    if choices and str(value) not in {str(item.get("data")) for item in choices if isinstance(item, dict)}:
-        return False
-    bounds = ranged.get("data") or {}
-    if not isinstance(bounds, dict):
-        return False
-    if bounds and ("minValue" in bounds or "maxValue" in bounds):
-        try:
-            number = float(value)
-            low = float(bounds.get("minValue", number))
-            high = float(bounds.get("maxValue", number))
-        except (TypeError, ValueError):
-            return False
-        if not all(math.isfinite(v) for v in (number, low, high)) or not low <= number <= high:
-            return False
-    return True
+def _laundry_selected_values(program) -> dict | None:
+    config = program.get("config") if isinstance(program, dict) else None
+    values = config.get("selectedValues") if isinstance(config, dict) else None
+    if not isinstance(values, list):
+        return None
+    return {str(item["attrName"]): item["attrValue"] for item in values
+            if isinstance(item, dict) and isinstance(item.get("attrName"), (str, int))
+            and isinstance(item.get("attrValue"), (str, int, float, bool))}
 
 
 def _laundry_programs(data: dict) -> dict:
@@ -1492,6 +1472,21 @@ def _laundry_programs(data: dict) -> dict:
         if isinstance(item, dict) and isinstance(item.get("name"), str):
             name = item["name"]
             business[name] = item.get("commandParameters") if name not in business else None
+    delay = ((data.get("controlBlock") or {}).get("delayStart") or {})
+    delay = delay if isinstance(delay, dict) else {}
+    delay_link = delay.get("link")
+    status_link = delay.get("statusLink")
+    delay_key = str(delay_link.get("name", "")) if isinstance(delay_link, dict) else ""
+    delay_status = str(status_link.get("name", "")) if isinstance(status_link, dict) else ""
+    status_attributes = [attr for attr in control.get("attributes", [])
+                         if isinstance(attr, dict) and str(attr.get("name")) == delay_status]
+    status_attribute = status_attributes[0] if len(status_attributes) == 1 else {}
+    status_list = status_attribute.get("list") or {}
+    can_disable_delay = (status_attribute.get("writable") is True
+                         and isinstance(status_list, dict)
+                         and isinstance(status_list.get("data"), list)
+                         and any(isinstance(item, dict) and item.get("data") == "false"
+                                 for item in status_list["data"]))
     entries = []
     dryer = (data.get("device") or {}).get("programDetails") or {}
     for item in dryer.get("details", []):
@@ -1533,10 +1528,18 @@ def _laundry_programs(data: dict) -> dict:
         override = {str(v["attrName"]): v["attrValue"] for v in selected}
         if len(override) != len(selected) or not set(override) <= set(field_names):
             continue
+        delay_field = next((field for field in fields if str(field["name"]) == delay_key), {})
+        delay_value = override.get(delay_key, delay_field.get("defaultValue"))
         commands = []
         for field in fields:
             name = str(field["name"])
             value = override.get(name, field.get("defaultValue"))
+            if (value is None and field.get("valueType") == "2"
+                    and name == delay_status and can_disable_delay
+                    and str(delay_value) in ("0", "0.0")
+                    and _laundry_value_valid(delay_field, delay_value)):
+                # Immediate start has no scheduled finish time; Evo leaves this slot dynamic.
+                value = "false"
             if not _laundry_value_valid(field, value):
                 break
             commands.append({"commandName": name, "value": value})
@@ -1597,7 +1600,12 @@ class HaierLaundry(HaierDevice):
         self.alarm_descriptions = descriptions if isinstance(descriptions, dict) else {}
         self.machine_entity_id = None
         self._last_finished_trace = None
+        self._finish_unsub = None
         self.programs = _laundry_programs(data)
+        self._program_data = data
+        self.program_catalog = build_catalogue(data, self.programs)
+        self._program_parameters = {}
+        self.connection_status = None
         self.actions = _laundry_actions(data)
         self.selected_program = None
         self._start_pending = False
@@ -1629,6 +1637,7 @@ class HaierLaundry(HaierDevice):
         program = program if isinstance(program, dict) else {}
         self._program_status = program.get("status")
         self._program_name = program.get("title")
+        self._active_program_values = _laundry_selected_values(program) or {}
         self.has_program = isinstance(data.get("program"), dict) or "monitoringScreen" in (data.get("device") or {})
         observed_status = control.get("status")
         self._get_status(dict(control))
@@ -1742,8 +1751,15 @@ class HaierLaundry(HaierDevice):
                 self._program_name = None
                 self.selected_program = None
             elif isinstance(program, dict):
-                self._program_status = program.get("status")
-                self._program_name = program.get("title")
+                selected = _laundry_selected_values(program)
+                if selected is not None:
+                    self._active_program_values = selected
+                elif program.get("title") and program["title"] != self._program_name:
+                    self._active_program_values = {}
+                if program.get("status"):
+                    self._program_status = program["status"]
+                if program.get("title"):
+                    self._program_name = program["title"]
                 if str(self._program_status or "").upper().removeprefix("PROGRAM_") in {"IN_PROGRESS", "FINISHED", "PAUSED", "CANCELED", "CANCELLED"}:
                     self._start_pending = False
             elif (str(values.get(str(self.phase_key))) == "0"
@@ -1836,15 +1852,47 @@ class HaierLaundry(HaierDevice):
     def _fire_laundry_event(self, event_type: str) -> None:
         if not self.machine_entity_id:
             return
-        self.hass.loop.call_soon_threadsafe(self.hass.bus.async_fire, "haier_evo_laundry_event", {
+        event = {
             "type": event_type, "entity_id": self.machine_entity_id,
             "name": self.device_name, "model": self.device_model,
             "kind": "dryer" if self.is_dryer else "washer",
             "program": self.program_name, "errors": self.error_details or [],
-        })
+        }
+        if event_type == "program_finished":
+            self.hass.loop.call_soon_threadsafe(self._schedule_finish_confirmation, event)
+        else:
+            self.hass.loop.call_soon_threadsafe(self.hass.bus.async_fire, "haier_evo_laundry_event", event)
+
+    def cancel_pending_finish(self) -> None:
+        if self._finish_unsub is not None:
+            self._finish_unsub()
+            self._finish_unsub = None
+
+    def _schedule_finish_confirmation(self, event: dict) -> None:
+        from homeassistant.helpers.event import async_call_later
+        if self.recovery is None:
+            return
+        self.cancel_pending_finish()
+
+        @callback
+        def confirm(_now):
+            self._finish_unsub = None
+            # Evo can finish a stage and immediately report the same cycle running again.
+            if self.available and not self._cycle_active and self.program_status != "cancelled":
+                event["errors"] = self.error_details or []
+                self.hass.bus.async_fire("haier_evo_laundry_event", event)
+
+        self._finish_unsub = async_call_later(self.hass, 10, confirm)
 
     def on_message(self, message_dict: dict) -> None:
         event = message_dict.get("event")
+        if event == "deviceConnectionStatusEvent":
+            payload = message_dict.get("payload")
+            status = payload.get("status") if isinstance(payload, dict) else None
+            if isinstance(status, str) and 0 < len(status) <= 64:
+                self.connection_status = status
+                self.write_ha_state()
+            return
         if event == "alarms":
             payload = message_dict.get("payload") or {}
             alarms = payload.get("alarms") if isinstance(payload, dict) else None
@@ -1880,6 +1928,11 @@ class HaierLaundry(HaierDevice):
                         if str(event_status).upper().removeprefix("PROGRAM_") in {"IN_PROGRESS", "FINISHED", "PAUSED", "CANCELED", "CANCELLED"}:
                             self._start_pending = False
                     if isinstance(program, dict):
+                        selected = _laundry_selected_values(program)
+                        if selected is not None:
+                            self._active_program_values = selected
+                        elif program.get("title") and program["title"] != self._program_name:
+                            self._active_program_values = {}
                         self._program_name = program.get("title", self._program_name)
                     trace = message_dict.get("trace")
                     if self.program_status in ("running", "paused"):
@@ -1912,6 +1965,48 @@ class HaierLaundry(HaierDevice):
             if value is not None and value not in self.programs:
                 raise HomeAssistantError("Неизвестная программа")
             self.selected_program = value
+            self._program_parameters = {}
+        self.write_ha_state()
+
+    @property
+    def program_settings(self) -> dict:
+        if self.selected_program not in self.programs:
+            return {}
+        try:
+            settings = program_settings(self._program_data, self.selected_program,
+                                        self.programs[self.selected_program], self._program_parameters,
+                                        self.values, self.alarm_codes)
+        except ValueError as err:
+            return {"program": self.selected_program, "fields": [], "error": str(err)}
+        return {key: value for key, value in settings.items() if key != "commands"}
+
+    @property
+    def active_program_details(self) -> dict:
+        if not self.available or not self._program_name:
+            return {}
+        details = active_program_details(self._program_data, self._program_name, self.programs,
+                                         self.values, self._active_program_values)
+        if self.remaining_time is not None:
+            details["remaining_minutes"] = self.remaining_time
+        return details
+
+    def configure_program(self, program: str, parameters: dict) -> None:
+        with self._laundry_lock:
+            if program != self.selected_program or program not in self.programs:
+                raise ServiceValidationError("Выбранная программа изменилась; откройте параметры заново")
+            if self._start_pending or self.program_status in ("running", "paused"):
+                raise ServiceValidationError("Параметры можно изменить до запуска программы")
+            settings = self.program_settings
+            editable = {field["key"] for field in settings.get("fields", []) if not field.get("disabled")}
+            if not isinstance(parameters, dict) or not parameters or not set(parameters) <= editable:
+                raise ServiceValidationError("Параметр недоступен для выбранной программы")
+            updated = {**self._program_parameters, **parameters}
+            try:
+                program_settings(self._program_data, program, self.programs[program], updated,
+                                 self.values, self.alarm_codes)
+            except ValueError as err:
+                raise ServiceValidationError(str(err)) from err
+            self._program_parameters = updated
         self.write_ha_state()
 
     def send_laundry_action(self, action: str) -> None:
@@ -1926,7 +2021,14 @@ class HaierLaundry(HaierDevice):
                 if action == "start":
                     if self.selected_program not in self.programs:
                         raise HomeAssistantError("Сначала выберите программу")
-                    message = {"action": "operation", **self.programs[self.selected_program]}
+                    try:
+                        settings = program_settings(self._program_data, self.selected_program,
+                                                    self.programs[self.selected_program], self._program_parameters,
+                                                    self.values, self.alarm_codes)
+                    except ValueError as err:
+                        raise HomeAssistantError(str(err)) from err
+                    message = {"action": "operation", **self.programs[self.selected_program],
+                               "commands": settings["commands"]}
                 elif action in self.actions:
                     message = {"action": "command", "command": self.actions[action]}
                 else:

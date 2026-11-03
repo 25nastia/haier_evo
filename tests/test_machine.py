@@ -1,4 +1,7 @@
 from unittest.mock import Mock
+from datetime import timedelta
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import async_fire_time_changed
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -98,6 +101,9 @@ async def test_observed_washer_finish_and_alarm_events_are_deduplicated(hass, en
     device.on_message(finish)
     device.on_message(finish)
     await hass.async_block_till_done()
+    assert len(events) == 1
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
     assert len(events) == 2
     assert events[1]["type"] == "program_finished"
     assert events[1]["program"] == "Смешанная"
@@ -134,3 +140,78 @@ def test_fault_sensor_preserves_unknown_codes_and_manufacturer_details():
     assert sensor.native_value == "Нет активных ошибок"
     device.on_message({"event": "deviceStatusEvent", "payload": {"status": "OFFLINE"}})
     assert sensor.native_value is None and not sensor.available
+
+
+@pytest.mark.asyncio
+async def test_configuring_program_is_local_validated_and_reset_on_new_selection(hass, enable_custom_integrations):
+    from test_laundry import dynamic_delay_fixture
+    entry = MockConfigEntry(domain="haier_evo", data={})
+    entry.add_to_hass(hass)
+    data = dynamic_delay_fixture()
+    data["smartDeviceControl"]["businessAttributes"][0]["commandParameters"]["attrNameList"][0].update({
+        "valueType": "3", "valueRange": {"list": {"type": "LIST", "data": [{"data": "1"}, {"data": "2"}]}}})
+    data["enrichAttributes"] = {"attrs": {"20": {"title": "Temperature"}}}
+    data["smartDeviceControl"]["attributes"].append({"name": "20", "writable": True,
+        "list": {"data": [{"data": "1"}, {"data": "2"}]}})
+    cloud = FakeCloud(data)
+    cloud.hass = hass
+    device = api.HaierDevice.create(cloud, "WM", "synthetic-device", device_title="Machine")
+    cloud.devices = [device]
+    hass.data.setdefault("haier_evo", {})[entry.entry_id] = cloud
+    platform = await async_setup_machines(hass, entry)
+    await hass.async_block_till_done()
+    entity_id = next(iter(platform.entities))
+    device.set_selected_program("Fabric - Cotton")
+    await hass.services.async_call("haier_evo", "configure_program", {
+        "entity_id": entity_id, "program": "Fabric - Cotton", "parameters": {"20": "2"}}, blocking=True)
+    await hass.async_block_till_done()
+    settings = hass.states.get(entity_id).attributes["program_settings"]
+    assert settings["program"] == "Fabric - Cotton"
+    assert settings["values"]["20"] == "2"
+    cloud.socket_app.send.assert_not_called()
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call("haier_evo", "configure_program", {
+            "entity_id": entity_id, "program": "Fabric - Cotton", "parameters": {"20": "99"}}, blocking=True)
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call("haier_evo", "configure_program", {
+            "entity_id": entity_id, "program": "Other", "parameters": {"20": "1"}}, blocking=True)
+    device.set_selected_program(None)
+    assert not device.program_settings
+    device.set_selected_program("Fabric - Cotton")
+    assert device.program_settings["values"]["20"] == "1"
+    await hass.services.async_call("haier_evo", "execute_action", {
+        "entity_id": entity_id, "action": "start"}, blocking=True)
+    import json
+    commands = json.loads(cloud.socket_app.send.call_args.args[0])["commands"]
+    assert next(c["value"] for c in commands if c["commandName"] == "20") == "1"
+    await platform.async_destroy()
+
+
+@pytest.mark.asyncio
+async def test_stage_finished_followed_by_running_does_not_publish_cycle_finished(hass, enable_custom_integrations):
+    entry = MockConfigEntry(domain="haier_evo", data={})
+    entry.add_to_hass(hass)
+    cloud = FakeCloud(control_fixture())
+    cloud.hass = hass
+    device = api.HaierDevice.create(cloud, "WM", "synthetic-device", device_title="Machine")
+    cloud.devices = [device]
+    hass.data.setdefault("haier_evo", {})[entry.entry_id] = cloud
+    events = []
+    hass.bus.async_listen("haier_evo_laundry_event", lambda event: events.append(event.data))
+    platform = await async_setup_machines(hass, entry)
+    await hass.async_block_till_done()
+    for status in ("IN_PROGRESS", "FINISHED", "IN_PROGRESS"):
+        device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+            "program": {"status": status, "title": "Mixed"}}})
+        await hass.async_block_till_done()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=11))
+    await hass.async_block_till_done()
+    assert not events and device.program_status == "running"
+    device.on_message({"event": "ProgramWasherBaseEvent", "data": {
+        "program": {"status": "FINISHED", "title": "Mixed"}}})
+    await hass.async_block_till_done()
+    await platform.async_destroy()
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=22))
+    await hass.async_block_till_done()
+    assert not events and device._finish_unsub is None
+    cloud.socket_app.send.assert_not_called()

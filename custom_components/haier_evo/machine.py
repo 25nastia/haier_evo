@@ -22,6 +22,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
         "execute_action", {vol.Required("action"): vol.In(api.LAUNDRY_ACTION_STATES)},
         "async_execute_action",
     )
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        "configure_program", {vol.Required("program"): str, vol.Required("parameters"): dict},
+        "async_configure_program",
+    )
 
 
 async def async_setup_machines(hass, entry):
@@ -41,6 +45,7 @@ async def async_setup_machines(hass, entry):
 
 
 class HaierLaundryEntity(Entity):
+    _unrecorded_attributes = frozenset({"program_catalog", "program_settings", "active_program_details"})
     _attr_has_entity_name = True
     _attr_name = None
     _attr_should_poll = False
@@ -79,7 +84,14 @@ class HaierLaundryEntity(Entity):
         return {
             "machine_kind": "dryer" if self._device.is_dryer else "washer",
             "available_actions": self._device.available_actions,
+            "connection_status": self._device.connection_status if self._device.available else None,
+            "program_catalog": self._device.program_catalog,
+            "program_settings": self._device.program_settings,
+            "active_program_details": self._device.active_program_details,
         }
 
     async def async_execute_action(self, action):
         await self.hass.async_add_executor_job(self._device.send_laundry_action, action)
+
+    async def async_configure_program(self, program, parameters):
+        await self.hass.async_add_executor_job(self._device.configure_program, program, parameters)
