@@ -9,13 +9,14 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import EntityPlatform
 
 from . import api
+from .coordinator import HaierLaundryCoordinator
 from .const import DOMAIN
 from .logger import _LOGGER
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
     cloud = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([HaierLaundryEntity(device) for device in cloud.devices
+    async_add_entities([HaierLaundryEntity(device, HaierLaundryCoordinator(hass, entry, device)) for device in cloud.devices
                         if isinstance(device, api.HaierLaundry)])
     entity_platform.async_get_current_platform().async_register_entity_service(
         "execute_action", {vol.Required("action"): vol.In(api.LAUNDRY_ACTION_STATES)},
@@ -45,7 +46,8 @@ class HaierLaundryEntity(Entity):
     _attr_should_poll = False
     _attr_translation_key = "laundry_machine"
 
-    def __init__(self, device):
+    def __init__(self, device, recovery):
+        self._recovery = recovery
         self._device = weakref.proxy(device)
         self._attr_unique_id = f"{device.device_id}_{device.device_model}_machine"
         self._attr_icon = "mdi:tumble-dryer" if device.is_dryer else "mdi:washing-machine"
@@ -53,8 +55,10 @@ class HaierLaundryEntity(Entity):
 
     async def async_added_to_hass(self):
         self._device.machine_entity_id = self.entity_id
+        self.async_on_remove(self._recovery.async_add_listener(self.async_write_ha_state))
 
     async def async_will_remove_from_hass(self):
+        await self._recovery.async_shutdown()
         self._device.machine_entity_id = None
         self._device.remove_write_ha_state_callback(self.async_write_ha_state)
 

@@ -1,4 +1,5 @@
 import json
+import asyncio
 import logging
 from pathlib import Path
 import pytest
@@ -12,6 +13,9 @@ from custom_components.haier_evo import api
 class FakeCloud:
     def __init__(self, data):
         self.data = data
+        self._laundry_poll_lock = asyncio.Lock()
+        self._laundry_retry_until = 0.0
+        self._laundry_next_request = 0.0
         self.hass = Mock()
         self.hass.config.language = "ru"
         self.socket_status = api.SocketStatus.INITIALIZED
@@ -67,7 +71,7 @@ def test_washer_phase_timer_and_offline_transition():
     cloud, device = create("WM", data)
     assert not device.available and device.phase == "Код 0" and device.remaining_time == 88
     sensors = {s._device_attr_name: s for s in device.create_entities_sensor()}
-    assert set(sensors) == {"phase", "remaining_time"}
+    assert set(sensors) == {"phase", "remaining_time", "program_status", "program_name"}
     assert sensors["phase"].entity_category == "diagnostic"
     assert sensors["remaining_time"].translation_key == "laundry_program_time"
     assert sensors["remaining_time"].device_class == "duration"
