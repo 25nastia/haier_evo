@@ -98,9 +98,9 @@ async def test_poll_backoff_blocks_event_bursts_and_resets_after_recovery(hass):
     cloud.read_device_snapshot.return_value = control_fixture()
     await coordinator._async_update_data()
     assert coordinator._failures == 0
-    assert coordinator.update_interval == timedelta(seconds=300)
+    assert coordinator.update_interval == timedelta(seconds=120)
     device._program_status = "IN_PROGRESS"
-    assert coordinator.normal_interval == timedelta(seconds=60)
+    assert coordinator.normal_interval == timedelta(seconds=30)
     await coordinator.async_shutdown()
 
 
@@ -238,7 +238,7 @@ async def test_fresh_running_push_avoids_http_poll_and_silence_recovers(hass):
         "program": {"status": "IN_PROGRESS", "title": "Mixed"}}})
     await coordinator._async_update_data()
     cloud.read_device_snapshot.assert_not_called()
-    device._last_observed -= 181
+    device._last_status_observed -= 46
     await coordinator._async_update_data()
     cloud.read_device_snapshot.assert_called_once()
     cloud.socket_app.send.assert_not_called()

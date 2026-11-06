@@ -33,7 +33,7 @@ class HaierLaundryCoordinator(DataUpdateCoordinator[None]):
         active = self.device.program_status in ("running", "paused")
         required = {str(key) for key in (self.device.phase_key, self.device.remote_key) if key is not None}
         incomplete = not required.issubset(self.device.values)
-        return timedelta(seconds=60 if active or incomplete or not self.device.available else 300)
+        return timedelta(seconds=30 if active else 60 if incomplete or not self.device.available else 120)
 
     @callback
     def request_refresh(self):
@@ -50,8 +50,11 @@ class HaierLaundryCoordinator(DataUpdateCoordinator[None]):
 
     @callback
     def _accept_push(self):
-        if self._closed or max(self._retry_until, self.cloud._laundry_retry_until) > time.monotonic():
+        if self._closed or self.cloud._laundry_retry_until > time.monotonic():
             return
+        if self.device.available and time.monotonic() - self.device._last_status_observed < 45:
+            self._retry_until = 0.0
+            self._failures = 0
         interval = self.normal_interval
         if interval != self.update_interval:
             self.update_interval = interval
@@ -62,7 +65,7 @@ class HaierLaundryCoordinator(DataUpdateCoordinator[None]):
         required = {str(key) for key in (self.device.phase_key, self.device.remote_key) if key is not None}
         if (self.device.available and self.device.program_status in ("running", "paused")
                 and required.issubset(self.device.values)
-                and time.monotonic() - self.device._last_observed < 180):
+                and time.monotonic() - self.device._last_status_observed < 45):
             self.update_interval = self.normal_interval
             return
         async with self.cloud._laundry_poll_lock:
